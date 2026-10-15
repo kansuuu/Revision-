@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Revision Buddy</title>
+<style>
+  :root { --bg:#10131a; --card:#1a1f2b; --text:#e8ecf4; --muted:#9aa4b8; --accent:#5b8cff; --good:#2fbf71; --bad:#e5534b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.3rem; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:.8rem; color:var(--muted); margin:8px 0 4px; }
+  input, select { width:100%; padding:10px; border-radius:8px; border:1px solid #2c3446; background:#0f121a; color:var(--text); font-size:1rem; }
+  button { padding:12px 16px; border:0; border-radius:10px; font-size:1rem; background:#2c3446; color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); }
+  button.on { background:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .row > * { flex:1; min-width:120px; }
+  .modes button { background:#232a3a; }
+  .modes button.active { background:var(--accent); }
+  #files { font-size:.85rem; color:var(--muted); margin-top:6px; }
+  #log { height:42vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px; }
+  .msg { padding:10px 12px; border-radius:10px; max-width:92%; white-space:pre-wrap; line-height:1.4; }
+  .me { background:#26314a; align-self:flex-end; }
+  .ai { background:#202a24; align-self:flex-start; border-left:3px solid var(--good); }
+  .sys { color:var(--muted); font-size:.85rem; align-self:center; }
+  #live { min-height:1.4em; color:var(--muted); font-style:italic; margin-top:8px; }
+  details summary { cursor:pointer; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Revision Buddy</h1>
+
+  <div class="card">
+    <details id="setup" open>
+      <summary>Setup (key, language, notes)</summary>
+      <label>Gemini API key (free from aistudio.google.com/app/apikey)</label>
+      <input id="key" type="password" placeholder="Paste key here" autocomplete="off">
+      <label>Model name</label>
+      <input id="model" value="gemini-2.5-flash">
+      <label>Voice language</label>
+      <select id="lang">
+        <option value="en-IN">English (India)</option>
+        <option value="en-US">English (US)</option>
+        <option value="en-GB">English (UK)</option>
+        <option value="hi-IN">Hindi</option>
+      </select>
+      <label>Your PDFs / notes (PDF, TXT, MD). Keep total under about 15 MB.</label>
+      <input id="fileIn" type="file" multiple accept=".pdf,.txt,.md,application/pdf,text/plain">
+      <div id="files">No notes loaded.</div>
+    </details>
+  </div>
+
+  <div class="card modes">
+    <div class="row">
+      <button id="mTeach" class="active">Teach mode<br><small>I explain, you stay quiet</small></button>
+      <button id="mTutor">Tutor mode<br><small>You explain, I ask</small></button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="log"><div class="msg sys">Pick a mode, tap Start listening, and talk.<br>Teach mode: say "any questions?" when you want to be quizzed.</div></div>
+    <div id="live"></div>
+  </div>
+
+  <div class="row">
+    <button id="micBtn" class="primary">Start listening</button>
+    <button id="askBtn">Ask me / Send now</button>
+    <button id="stopBtn">Stop talking</button>
+    <button id="newBtn">New session</button>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <label>Or type (the tablet keyboard mic works too)</label>
+    <div class="row">
+      <input id="typed" placeholder="Type a message" style="flex:3">
+      <button id="sendBtn" style="flex:1">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let mode = 'teach', listening = false, speaking = false, rec = null;
+let buffer = '', timer = null, history = [], fileParts = [], filesSent = 0, busy = false;
+
+// ---------- saved settings ----------
+try {
+  $('key').value = localStorage.getItem('rb_key') || '';
+  $('model').value = localStorage.getItem('rb_model') || 'gemini-2.5-flash';
+  $('lang').value = localStorage.getItem('rb_lang') || 'en-IN';
+} catch (e) {}
+['key','model','lang'].forEach(id => $(id).addEventListener('change', () => {
+  try { localStorage.setItem('rb_' + id, $(id).value.trim()); } catch (e) {}
+}));
+
+// ---------- UI helpers ----------
+function add(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+function setMode(m) {
+  mode = m;
+  $('mTeach').classList.toggle('active', m === 'teach');
+  $('mTutor').classList.toggle('active', m === 'tutor');
+  buffer = ''; clearTimeout(timer); $('live').textContent = '';
+  add('sys', m === 'teach'
+    ? 'Teach mode: explain freely. Say "any questions?" to be quizzed.'
+    : 'Tutor mode: ask me anything. I will explain and can search the web.');
+}
+$('mTeach').onclick = () => setMode('teach');
+$('mTutor').onclick = () => setMode('tutor');
+
+// ---------- notes ----------
+$('fileIn').addEventListener('change', async e => {
+  fileParts = []; filesSent = 0; history = [];
+  let total = 0, names = [];
+  for (const f of e.target.files) {
+    total += f.size;
+    if (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) {
+      const data = await new Promise(res => {
+        const r = new FileReader();
+        r.onload = () => res(r.result.split(',')[1]);
+        r.readAsDataURL(f);
+      });
+      fileParts.push({ inline_data: { mime_type: 'application/pdf', data } });
+    } else {
+      const text = await f.text();
+      fileParts.push({ text: 'Notes from file "' + f.name + '":\n' + text });
+    }
+    names.push(f.name);
+  }
+  $('files').textContent = names.length
+    ? names.join(', ') + ' (' + (total / 1048576).toFixed(1) + ' MB)'
+    : 'No notes loaded.';
+  if (total > 15 * 1048576) add('sys', 'Warning: notes are over 15 MB. Gemini may reject them. Use fewer or smaller files.');
+});
+
+// ---------- prompts ----------
+function systemPrompt() {
+  const base = 'The student has attached their own notes. Treat the notes as the main source. Your replies are spoken aloud, so use plain short sentences. No markdown, no bullet points, no symbols, no emojis.';
+  if (mode === 'teach') {
+    return base + ' You are a quiet revision partner. The student explains concepts out loud. You only receive a message when they finished explaining and asked you something, or when they answered your question. If they asked for questions, ask one or two short, reasonable questions that test gaps or misconceptions in their explanation, based on the notes. If they answered a question, say briefly whether it is right and correct what is missing. If they only explained and did not ask anything, reply with just: Okay. Never lecture. Keep replies under 60 words.';
+  }
+  return base + ' You are a friendly tutor for a student who is tired and wants to listen. Explain concepts simply from the notes first, with one small example. If the notes do not cover the question, use web search and say clearly that the answer comes from outside their notes. Answer what was asked, keep it under 120 words, and offer to go deeper at the end.';
+}
+
+// ---------- Gemini ----------
+async function send(text) {
+  text = text.trim();
+  if (!text) return;
+  const key = $('key').value.trim();
+  if (!key) { add('sys', 'Add your Gemini API key in Setup first.'); return; }
+  if (busy) { buffer = text + ' ' + buffer; return; }
+  busy = true;
+  add('me', text);
+  const parts = fileParts.slice(filesSent).slice();
+  filesSent = fileParts.length;
+  parts.push({ text });
+  history.push({ role: 'user', parts });
+  $('live').textContent = 'Thinking...';
+  try {
+    const body = {
+      system_instruction: { parts: [{ text: systemPrompt() }] },
+      contents: history
+    };
+    if (mode === 'tutor') body.tools = [{ google_search: {} }];
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent($('model').value.trim()) + ':generateContent?key=' + encodeURIComponent(key);
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+    const reply = ((data.candidates || [])[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+    if (!reply) throw new Error('Empty reply (maybe blocked). Try rephrasing.');
+    history.push({ role: 'model', parts: [{ text: reply }] });
+    add('ai', reply);
+    speak(reply);
+  } catch (err) {
+    history.pop();
+    filesSent = Math.max(0, filesSent - parts.filter(p => !p.text || p.text.startsWith('Notes from')).length);
+    add('sys', 'Error: ' + err.message);
+  } finally {
+    busy = false;
+    $('live').textContent = '';
+  }
+}
+
+// ---------- speech out ----------
+function speak(t) {
+  t = t.replace(/\[(.*?)\]\(.*?\)/g, '$1').replace(/[*#_`>~]/g, '');
+  const chunks = (t.match(/[^.!?\n]+[.!?]*/g) || [t]).map(s => s.trim()).filter(Boolean);
+  if (!chunks.length) return;
+  speechSynthesis.cancel();
+  speaking = true;
+  try { rec && rec.stop(); } catch (e) {}
+  chunks.forEach((c, i) => {
+    const u = new SpeechSynthesisUtterance(c);
+    u.lang = $('lang').value;
+    if (i === chunks.length - 1) {
+      u.onend = u.onerror = () => { speaking = false; if (listening) startRec(); };
+    }
+    speechSynthesis.speak(u);
+  });
+}
+$('stopBtn').onclick = () => { speechSynthesis.cancel(); speaking = false; if (listening) startRec(); };
+
+// ---------- speech in ----------
+const TRIGGER = /(any questions?|do you have any questions?|quiz me|that'?s my answer|check my explanation)/i;
+function onFinal(text) {
+  if (!text) return;
+  buffer += (buffer ? ' ' : '') + text;
+  $('live').textContent = buffer;
+  if (mode === 'teach') {
+    if (TRIGGER.test(text)) flush();
+  } else {
+    clearTimeout(timer);
+    timer = setTimeout(flush, 1800);
+  }
+}
+function flush() {
+  clearTimeout(timer);
+  const t = buffer.trim();
+  buffer = '';
+  $('live').textContent = '';
+  if (t) send(t);
+}
+function startRec() {
+  if (!SR) { add('sys', 'Speech recognition is not supported in this browser. Use Chrome, or type / use the keyboard mic.'); return; }
+  try { rec && (rec.onend = null, rec.stop()); } catch (e) {}
+  rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = $('lang').value;
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) onFinal(r[0].transcript.trim());
+      else interim += r[0].transcript;
+    }
+    if (interim) $('live').textContent = (buffer ? buffer + ' ' : '') + interim;
+  };
+  rec.onerror = e => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      listening = false; updateMic();
+      add('sys', 'Microphone blocked. Allow mic permission for this page, or open the file from a hosted link (see instructions).');
+    }
+  };
+  rec.onend = () => { if (listening && !speaking) setTimeout(startRec, 300); };
+  try { rec.start(); } catch (e) {}
+}
+function updateMic() {
+  $('micBtn').textContent = listening ? 'Stop listening' : 'Start listening';
+  $('micBtn').classList.toggle('on', listening);
+}
+$('micBtn').onclick = () => {
+  listening = !listening;
+  updateMic();
+  if (listening) startRec();
+  else { try { rec && (rec.onend = null, rec.stop()); } catch (e) {} flush(); }
+};
+$('askBtn').onclick = () => {
+  if (mode === 'teach' && !TRIGGER.test(buffer)) buffer += ' Any questions?';
+  flush();
+};
+$('sendBtn').onclick = () => { const v = $('typed').value; $('typed').value = ''; send(v); };
+$('typed').addEventListener('keydown', e => { if (e.key === 'Enter') $('sendBtn').click(); });
+$('newBtn').onclick = () => {
+  history = []; filesSent = 0; buffer = '';
+  $('log').innerHTML = '';
+  add('sys', 'New session started. Your notes are still loaded.');
+};
+</script>
+</body>
+</html>
